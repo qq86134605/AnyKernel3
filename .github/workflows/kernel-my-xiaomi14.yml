@@ -1,0 +1,158 @@
+name: Android 内核构建-自定义
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+
+# ================== 已固化配置（本机专用，要改就改这里） ===================
+# 内核版本   : 6.1       子版本: 6.1.138   安全补丁级别: 2025-06   Android 14
+# KernelSU   : ReSukiSU
+# 版本名     : android14-11-g0c3d559bcd85-ab14529422
+# 构建时间   : Wed Dec 3 02:05:30 UTC 2025
+# 功能开关   : SUSFS 开 / ZRAM 开 / BBG 开 / KPM 关闭 / Re-Kernel 开
+#              Droidspaces 关 / NTSync 关 / CVE-2026-43499 开 / 一加支持 关
+# 产物上传   : 仅上传 AnyKernel3.zip
+# ===========================================================================
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      android_version: ${{ steps.resolve.outputs.android_version }}
+      sub_level: ${{ steps.resolve.outputs.sub_level }}
+      kernel_full: ${{ steps.resolve.outputs.kernel_full }}
+      os_patch_level: ${{ steps.resolve.outputs.os_patch_level }}
+    steps:
+      - name: 检出版本数据
+        uses: actions/checkout@v7
+
+      - name: 解析安全补丁级别
+        id: resolve
+        env:
+          KERNEL_VERSION: "6.1"
+          SUB_LEVEL_6_1: "138 (2025-06)"
+          OS_PATCH_LEVEL: "2025-06"
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          kernel_version = os.environ["KERNEL_VERSION"]
+          os_patch_level = os.environ["OS_PATCH_LEVEL"].strip()
+          android_map = {
+              "5.10": "android12",
+              "5.15": "android13",
+              "6.1": "android14",
+              "6.6": "android15",
+              "6.12": "android16",
+          }
+          android_version = android_map.get(kernel_version)
+          if android_version is None:
+              print(f"::error::未适配的内核版本: {kernel_version}")
+              sys.exit(1)
+
+          data_path = Path("data") / android_version / f"{kernel_version}.json"
+
+          if not data_path.exists():
+              print(f"::error::未找到版本数据: {data_path}")
+              sys.exit(1)
+
+          with data_path.open("r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          # 按内核版本取对应的子版本下拉输入
+          sub_level_input = os.environ.get(f"SUB_LEVEL_{kernel_version.replace('.', '_')}", "").strip()
+
+          if sub_level_input and not sub_level_input.startswith("auto"):
+              # 按子版本反查安全补丁级别，如 "138 (2025-06)" -> 2025-06
+              token = sub_level_input.split()[0]
+              if token == "lts":
+                  kernel_full = data.get("lts")
+                  if not kernel_full:
+                      print(f"::error::{android_version} / {kernel_version} 缺少 LTS 版本数据")
+                      sys.exit(1)
+                  sub_level = "X"
+                  patch_level = "lts"
+              elif token.isdigit():
+                  matches = [
+                      entry for entry in data.get("entries", [])
+                      if entry.get("kernel") == f"{kernel_version}.{token}"
+                  ]
+                  if not matches:
+                      print(f"::error::未找到 {android_version} / {kernel_version}.{token} 对应的版本数据")
+                      sys.exit(1)
+                  # entries 按日期升序，取该子版本对应的最新安全补丁级别
+                  latest = matches[-1]
+                  kernel_full = latest.get("kernel", "")
+                  patch_level = latest.get("date", "")
+                  sub_level = token
+              else:
+                  print(f"::error::无法识别的子版本: {sub_level_input}")
+                  sys.exit(1)
+          else:
+              patch_level = os_patch_level
+              if patch_level == "lts":
+                  kernel_full = data.get("lts")
+                  if not kernel_full:
+                      print(f"::error::{android_version} / {kernel_version} 缺少 LTS 版本数据")
+                      sys.exit(1)
+                  sub_level = "X"
+              else:
+                  matched = next(
+                      (entry for entry in data.get("entries", []) if entry.get("date") == os_patch_level),
+                      None,
+                  )
+                  if matched is None:
+                      print(f"::error::未找到 {android_version} / {kernel_version} / {os_patch_level} 对应的版本数据")
+                      sys.exit(1)
+                  kernel_full = matched.get("kernel", "")
+                  prefix = f"{kernel_version}."
+                  if not kernel_full.startswith(prefix):
+                      print(f"::error::版本数据异常: {kernel_full} 不属于 {kernel_version}")
+                      sys.exit(1)
+                  sub_level = kernel_full.rsplit(".", 1)[-1]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"android_version={android_version}\n")
+              output.write(f"sub_level={sub_level}\n")
+              output.write(f"kernel_full={kernel_full}\n")
+              output.write(f"os_patch_level={patch_level}\n")
+
+          print(f"解析结果: {android_version} / {kernel_full} / 补丁级别 {patch_level}，子版本号: {sub_level}")
+          PY
+
+  build-custom-kernel:
+    name: "${{ needs.resolve-version.outputs.kernel_full }}-${{ needs.resolve-version.outputs.android_version }}-${{ needs.resolve-version.outputs.os_patch_level }}"
+    needs: resolve-version
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      android_version: ${{ needs.resolve-version.outputs.android_version }}
+      kernel_version: "6.1"
+      sub_level: ${{ needs.resolve-version.outputs.sub_level }}
+      os_patch_level: ${{ needs.resolve-version.outputs.os_patch_level }}
+      revision: "r1"
+      ksu_variant: "ReSukiSU"
+      version: "android14-11-g0c3d559bcd85-ab14529422"
+      build_time: "Wed Dec 3 02:05:30 UTC 2025"
+      use_zram: true
+      use_bbg: true
+      use_kpm: "disabled (关闭)"
+      use_rekernel: true
+      cve_2026_43499_patch: true
+      supp_op: false
+      enable_susfs: true
+      droidspaces: "off"
+      droidspaces_ntsync: false
+      artifact_upload_mode: "仅上传 AnyKernel3.zip"
+
+  get-ksu-manager:
+    uses: ./.github/workflows/get-manager.yml
+    secrets: inherit
+    with:
+      kernelsu_variant: "ReSukiSU"
